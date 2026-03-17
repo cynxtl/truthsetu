@@ -1,3 +1,14 @@
+"""
+TruthSetu — VERIFY Agent (with web search)
+==========================================
+Pipeline:
+  1. Check template cache (instant)
+  2. FAISS search (local knowledge base)
+  3. If evidence weak → Groq calls web search tool
+  4. Groq reasons over FAISS + web results
+  5. Return structured verdict
+"""
+
 import json
 import re
 from datetime import datetime, timedelta
@@ -5,15 +16,14 @@ from pathlib import Path
 from typing import Optional
 
 import faiss
-import feedparser
 import numpy as np
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from groq import Groq
 from loguru import logger
 from sentence_transformers import SentenceTransformer
+import feedparser
+from bs4 import BeautifulSoup
 
 from backend.core.config import get_settings
-from backend.core.llm import get_llm
 
 settings = get_settings()
 
@@ -35,63 +45,91 @@ SOURCE_WEIGHTS = {
     "hindustantimes.com": {"weight": 0.80, "tier": "tier2_news"},
     "thewire.in":         {"weight": 0.82, "tier": "tier2_news"},
     "wikipedia.org":      {"weight": 0.85, "tier": "encyclopedia"},
+    "truthsetu.static":   {"weight": 0.88, "tier": "government"},
+    "web_search":         {"weight": 0.70, "tier": "web"},
 }
 
-# ── Claim type classification ─────────────────────────────────
+# ── Time anchors for claim classification ────────────────────
 TIME_ANCHORS = [
     "today", "tonight", "tomorrow", "yesterday",
     "right now", "currently", "this morning", "in the next",
     "aaj", "abhi", "kal", "abhi abhi",
 ]
 
-VERIFY_PROMPT = PromptTemplate(
-    input_variables=["claim", "sources"],
-    template="""You are a crisis fact-checker for India's disaster management system.
-Your job is to verify claims using ONLY the provided source documents.
-Do NOT use any knowledge from your training data.
+# ── Web search tool definition for Groq ──────────────────────
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_web",
+        "description": (
+            "Search the web for recent news, official statements, and "
+            "verified information about a crisis claim in India. "
+            "Use this when the provided documents are insufficient, "
+            "outdated, or do not directly address the claim. "
+            "Always search for Indian government sources like IMD, "
+            "NDMA, PIB, WHO India when relevant."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Specific search query. Include location, "
+                        "crisis type, and time context. "
+                        "Example: 'IMD cyclone Chennai warning today 2026'"
+                    )
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
 
-CLAIM: "{claim}"
+# ── System prompt ─────────────────────────────────────────────
+SYSTEM_PROMPT = """You are TruthSetu, India's crisis fact-checking AI.
+Your job is to verify claims during emergencies — cyclones, floods, 
+pandemics, elections, and communal events.
 
-TRUSTED SOURCE DOCUMENTS:
-{sources}
+VERIFICATION RULES:
+1. Base your verdict ONLY on provided documents and web search results
+2. Do NOT use your training data knowledge — always verify with sources
+3. Government sources (GOV) take highest priority
+4. Fact-check sources (FC) are strong evidence
+5. If documents are insufficient, USE the search_web tool
+6. Search specifically for Indian government sources when relevant
+
+VERDICT CRITERIA:
+- FALSE        (score 0-34):  Contradicts trusted sources
+- UNVERIFIABLE (score 35-69): Insufficient evidence found
+- TRUE         (score 70-100): Supported by trusted sources
+
+IMPORTANT: You MUST use search_web if:
+- No documents are relevant to the claim
+- Documents are older than 24 hours for time-sensitive claims
+- The claim mentions a specific recent event you need to verify"""
+
+# ── User prompt template ──────────────────────────────────────
+def build_user_prompt(claim: str, docs_context: str) -> str:
+    return f"""Verify this claim: "{claim}"
+
+DOCUMENTS FROM KNOWLEDGE BASE:
+{docs_context if docs_context else "No relevant documents found in knowledge base."}
 
 INSTRUCTIONS:
-- Base your verdict ONLY on the documents above
-- Government sources (GOV) take priority over news sources
-- Fact-check sources (FC) are strong evidence of false claims
-- If documents contradict the claim → FALSE
-- If documents support the claim → TRUE
-- If documents are insufficient → UNVERIFIABLE
+- Review the documents above
+- If they are sufficient to verify the claim, return your verdict
+- If they are insufficient or outdated, use search_web to find current information
+- After searching, combine all evidence and return your verdict
 
-Credibility score 0-100:
-  0-34  = FALSE   (contradicts sources or no evidence)
-  35-69 = UNVERIFIABLE (insufficient evidence)
-  70-100 = TRUE   (supported by trusted sources)
-
-Respond ONLY with valid JSON, nothing else:
+Return your final verdict as JSON:
 {{
   "verdict": "TRUE" or "FALSE" or "UNVERIFIABLE",
   "credibility_score": <integer 0-100>,
-  "reasoning": "<2-3 sentence explanation citing sources>",
-  "sources_used": ["<source name or URL>"]
+  "reasoning": "<2-3 sentences citing your sources>",
+  "sources_used": ["<source names>"],
+  "web_searched": true or false
 }}"""
-)
-
-CLASSIFY_PROMPT = PromptTemplate(
-    input_variables=["claim"],
-    template="""Classify this claim into exactly ONE category:
-
-EPHEMERAL   - time-sensitive, changes within hours or days
-             (weather, crisis alerts, rescue status, live events)
-PERMANENT   - historical fact, does not change over time
-             (deaths, laws passed, court verdicts, historical events)
-SEMI_PERMANENT - changes slowly over months or years
-             (policies, appointments, disease outbreaks)
-
-Claim: "{claim}"
-
-Respond with only one word: EPHEMERAL or PERMANENT or SEMI_PERMANENT"""
-)
 
 
 def freshness_weight(date_str: str, claim_type: str) -> float:
@@ -102,20 +140,17 @@ def freshness_weight(date_str: str, claim_type: str) -> float:
 
         if claim_type == "PERMANENT":
             return 1.0
-
         if claim_type == "SEMI_PERMANENT":
-            if age < timedelta(days=30):   return 1.0
-            if age < timedelta(days=90):   return 0.9
-            if age < timedelta(days=365):  return 0.7
+            if age < timedelta(days=30):  return 1.0
+            if age < timedelta(days=90):  return 0.9
+            if age < timedelta(days=365): return 0.7
             return 0.5
-
         # EPHEMERAL
-        if age < timedelta(hours=2):   return 1.0
-        if age < timedelta(hours=6):   return 0.9
-        if age < timedelta(hours=24):  return 0.7
-        if age < timedelta(days=3):    return 0.3
+        if age < timedelta(hours=2):  return 1.0
+        if age < timedelta(hours=6):  return 0.9
+        if age < timedelta(hours=24): return 0.7
+        if age < timedelta(days=3):   return 0.3
         return 0.1
-
     except Exception:
         return 0.5
 
@@ -123,22 +158,27 @@ def freshness_weight(date_str: str, claim_type: str) -> float:
 class VerifyAgent:
 
     def __init__(self):
-        self._embedder: Optional[SentenceTransformer] = None
-        self._index:    Optional[faiss.Index] = None
+        self._embedder:  Optional[SentenceTransformer] = None
+        self._index:     Optional[faiss.Index] = None
         self._documents: list = []
-        self._chain     = None
-        self._classify_chain = None
-        self._ready     = False
+        self._groq:      Optional[Groq] = None
+        self._ready = False
 
     async def initialize(self):
         logger.info("Initialising VERIFY agent...")
+
+        # Sentence transformer for embeddings
         self._embedder = SentenceTransformer(settings.embedding_model)
-        llm = get_llm()
-        self._chain          = VERIFY_PROMPT    | llm | StrOutputParser()
-        self._classify_chain = CLASSIFY_PROMPT  | llm | StrOutputParser()
+
+        # Direct Groq client for tool calling
+        # (LangChain doesn't support tool calling + streaming well)
+        self._groq = Groq(api_key=settings.groq_api_key)
+
         await self._load_or_build_index()
         self._ready = True
         logger.success("VERIFY agent ready ✓")
+
+    # ── Index management ──────────────────────────────────────
 
     async def _load_or_build_index(self):
         index_file = Path(settings.faiss_index_path) / "index.faiss"
@@ -147,7 +187,9 @@ class VerifyAgent:
         if index_file.exists() and docs_file.exists():
             logger.info("Loading FAISS index from disk...")
             self._index     = faiss.read_index(str(index_file))
-            self._documents = json.loads(docs_file.read_text(encoding="utf-8"))
+            self._documents = json.loads(
+                docs_file.read_text(encoding="utf-8")
+            )
             logger.info(f"Loaded {len(self._documents)} documents ✓")
         else:
             logger.info("No index found — building from RSS feeds...")
@@ -185,15 +227,12 @@ class VerifyAgent:
                     if not title:
                         continue
 
-                    # Strip HTML
-                    from bs4 import BeautifulSoup
                     summary = BeautifulSoup(
                         summary, "html.parser"
                     ).get_text(separator=" ").strip()[:500]
 
                     text = f"{title}. {summary}".strip()
 
-                    # Skip rumour-reporting chunks
                     if any(p in text.lower() for p in rumour_phrases):
                         continue
 
@@ -209,7 +248,6 @@ class VerifyAgent:
                         )["tier"],
                         "date":   date,
                     })
-
                 logger.info(f"  {key}: {len(feed.entries)} entries")
             except Exception as e:
                 logger.warning(f"  {key} failed: {e}")
@@ -244,14 +282,54 @@ class VerifyAgent:
         logger.info("Rebuilding FAISS index...")
         await self._build_index()
 
+    # ── Web search ────────────────────────────────────────────
+
+    async def _web_search(self, query: str) -> list[dict]:
+        """
+        Search the web using DuckDuckGo.
+        Returns list of {title, url, snippet} dicts.
+        """
+        try:
+            from ddgs import DDGS
+
+            logger.info(f"Web search: {query}")
+            results = []
+
+            with DDGS() as ddgs:
+                for r in ddgs.text(
+                    query,
+                    region="in-en",        # India English results
+                    safesearch="moderate",
+                    max_results=5,
+                ):
+                    results.append({
+                        "text":   f"{r.get('title','')}. {r.get('body','')}",
+                        "source": "web_search",
+                        "url":    r.get("href", ""),
+                        "weight": 0.70,
+                        "tier":   "web",
+                        "date":   "",
+                        "query":  query,
+                    })
+
+            logger.info(f"Web search returned {len(results)} results")
+            return results
+
+        except Exception as e:
+            logger.warning(f"Web search failed: {e}")
+            return []
+
+    # ── FAISS retrieval ───────────────────────────────────────
+
     def _classify_claim_type(self, claim: str) -> str:
-        # Fast check for time anchors first
         claim_lower = claim.lower()
         if any(anchor in claim_lower for anchor in TIME_ANCHORS):
             return "EPHEMERAL"
-        return "EPHEMERAL"  # default — LLM classification in next version
+        return "EPHEMERAL"
 
-    def _retrieve(self, claim: str, claim_type: str, top_k: int = 5) -> list:
+    def _retrieve(
+        self, claim: str, claim_type: str, top_k: int = 5
+    ) -> list:
         if not self._index or self._index.ntotal == 0:
             return []
 
@@ -267,29 +345,170 @@ class VerifyAgent:
             if idx < 0:
                 continue
             doc = {**self._documents[idx], "similarity": float(score)}
-
-            # Apply freshness weight
             fresh = freshness_weight(doc.get("date", ""), claim_type)
             doc["final_weight"] = doc["weight"] * fresh
             results.append(doc)
 
-        # Sort by final_weight
         results.sort(key=lambda x: x["final_weight"], reverse=True)
         return results
 
-    def _format_sources(self, docs: list) -> str:
+    def _format_docs(self, docs: list) -> str:
+        if not docs:
+            return "No documents found."
         lines = []
         for i, doc in enumerate(docs, 1):
             tier = doc.get("tier", "unknown").upper()
             tag  = "GOV" if tier == "GOVERNMENT" else \
-                   "FC"  if tier == "FACT_CHECK"  else "NEWS"
+                   "FC"  if tier == "FACT_CHECK"  else \
+                   "WEB" if tier == "WEB"          else "NEWS"
             lines.append(
-                f"[{i}] ({doc['source']}) [{tag}] "
-                f"weight:{doc['final_weight']:.2f}\n{doc['text'][:300]}"
+                f"[{i}] [{tag}] {doc['source']}\n"
+                f"{doc['text'][:300]}"
             )
         return "\n\n".join(lines)
 
-    def _parse_llm_output(self, raw: str, retrieved: list) -> dict:
+    # ── Template cache ────────────────────────────────────────
+
+    async def _check_template_cache(
+        self, claim: str
+    ) -> Optional[dict]:
+        try:
+            from backend.db.mongodb import get_db
+            db  = get_db()
+            emb = self._embedder.encode([claim])[0].tolist()
+
+            templates = await db.templates.find(
+                {},
+                {"template_text": 1, "verdict": 1,
+                 "credibility_score": 1, "explanation": 1,
+                 "source": 1, "embedding": 1}
+            ).to_list(length=200)
+
+            for t in templates:
+                if not t.get("embedding"):
+                    continue
+                a   = np.array(emb)
+                b   = np.array(t["embedding"])
+                sim = float(
+                    np.dot(a, b) /
+                    (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10)
+                )
+                if sim > 0.85:
+                    await db.templates.update_one(
+                        {"_id": t["_id"]},
+                        {"$inc": {"occurrence_count": 1},
+                         "$set": {"last_seen": datetime.utcnow()}}
+                    )
+                    return {
+                        "verdict":           t["verdict"],
+                        "credibility_score": t["credibility_score"],
+                        "reasoning":         t.get("explanation", ""),
+                        "sources":           [t.get("source", "")],
+                        "web_searched":      False,
+                    }
+        except Exception as e:
+            logger.warning(f"Template cache check failed: {e}")
+        return None
+
+    # ── Main Groq call with tool calling ─────────────────────
+
+    async def _call_groq_with_tools(
+        self, claim: str, faiss_docs: list
+    ) -> dict:
+        """
+        Call Groq with web search tool.
+        Groq decides whether to search the web based on evidence quality.
+        """
+        docs_context  = self._format_docs(faiss_docs)
+        user_message  = build_user_prompt(claim, docs_context)
+        messages      = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_message},
+        ]
+        web_searched  = False
+        search_results = []
+
+        # ── Round 1: Initial Groq call ────────────────────────
+        response = self._groq.chat.completions.create(
+            model=settings.groq_model,
+            messages=messages,
+            tools=[WEB_SEARCH_TOOL],
+            tool_choice="auto",  # Groq decides when to search
+            temperature=0.1,
+            max_tokens=1024,
+        )
+
+        msg = response.choices[0].message
+
+        # ── Check if Groq wants to search the web ─────────────
+        if msg.tool_calls:
+            logger.info(f"Groq requesting {len(msg.tool_calls)} web search(es)")
+
+            # Add assistant message to conversation
+            messages.append({
+                "role":       "assistant",
+                "content":    msg.content or "",
+                "tool_calls": [
+                    {
+                        "id":       tc.id,
+                        "type":     "function",
+                        "function": {
+                            "name":      tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                    }
+                    for tc in msg.tool_calls
+                ]
+            })
+
+            # Execute each tool call
+            for tool_call in msg.tool_calls:
+                if tool_call.function.name == "search_web":
+                    args  = json.loads(tool_call.function.arguments)
+                    query = args.get("query", claim)
+
+                    # Actually search the web
+                    results     = await self._web_search(query)
+                    search_results.extend(results)
+                    web_searched = True
+
+                    # Format results for Groq
+                    search_text = "\n\n".join([
+                        f"[Web Result {i+1}] {r['url']}\n{r['text'][:300]}"
+                        for i, r in enumerate(results)
+                    ]) if results else "No web results found."
+
+                    # Add tool result to conversation
+                    messages.append({
+                        "role":        "tool",
+                        "tool_call_id": tool_call.id,
+                        "content":     search_text,
+                    })
+
+            # ── Round 2: Groq reasons with web results ────────
+            logger.info("Groq reasoning with web search results...")
+            response2 = self._groq.chat.completions.create(
+                model=settings.groq_model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            final_text = response2.choices[0].message.content or ""
+
+        else:
+            # Groq decided FAISS docs were sufficient — no web search
+            logger.info("Groq using FAISS docs only (no web search needed)")
+            final_text = msg.content or ""
+
+        # ── Parse verdict JSON ────────────────────────────────
+        result = self._parse_verdict(final_text, faiss_docs + search_results)
+        result["web_searched"]    = web_searched
+        result["web_result_count"] = len(search_results)
+
+        return result
+
+    def _parse_verdict(self, raw: str, docs: list) -> dict:
+        """Extract JSON verdict from LLM output."""
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         if m:
             try:
@@ -316,10 +535,14 @@ class VerifyAgent:
             "verdict":           verdict,
             "credibility_score": score,
             "reasoning":         raw[:300],
-            "sources":           [d["url"] for d in retrieved[:2]],
+            "sources":           [d["url"] for d in docs[:2]],
         }
 
-    async def verify(self, claim: str, platform: str = "manual") -> dict:
+    # ── Main entry point ──────────────────────────────────────
+
+    async def verify(
+        self, claim: str, platform: str = "manual"
+    ) -> dict:
         if not self._ready:
             await self.initialize()
 
@@ -328,46 +551,50 @@ class VerifyAgent:
         # Step 1 — classify claim type
         claim_type = self._classify_claim_type(claim)
 
-        # Step 2 — check template cache first (fast path)
+        # Step 2 — check template cache (instant path)
         cached = await self._check_template_cache(claim)
         if cached:
-            logger.info("Cache hit — returning cached verdict")
-            return {**cached, "from_cache": True,
-                    "verified_at": datetime.utcnow().isoformat()}
+            logger.info("Template cache hit ✓")
+            return {
+                **cached,
+                "claim":          claim,
+                "claim_type":     claim_type,
+                "platform":       platform,
+                "retrieved_docs": [],
+                "from_cache":     True,
+                "verified_at":    datetime.utcnow().isoformat(),
+            }
 
-        # Step 3 — retrieve from FAISS
+        # Step 3 — FAISS retrieval
         retrieved = self._retrieve(claim, claim_type)
-
-        if not retrieved:
-            return self._no_sources_result(claim, claim_type)
-
-        # Step 4 — check minimum relevance
-        if retrieved[0]["similarity"] < 0.3:
-            return self._no_sources_result(claim, claim_type)
-
-        # Step 5 — call Groq
-        source_ctx = self._format_sources(retrieved)
-        try:
-            raw    = await self._chain.ainvoke({
-                "claim":   claim,
-                "sources": source_ctx,
-            })
-            result = self._parse_llm_output(raw, retrieved)
-        except Exception as e:
-            logger.error(f"LLM error: {e}")
-            return self._error_result(claim, str(e))
-
-        # Step 6 — trust weight adjustment
-        top_w = max(
-            (d.get("final_weight", 0.6) for d in retrieved[:3]),
-            default=0.6
+        top_sim = retrieved[0]['similarity'] if retrieved else 0.0
+        logger.info(
+            f"FAISS retrieved {len(retrieved)} docs, "
+            f"top similarity: {top_sim:.3f}"
         )
-        score = result["credibility_score"]
-        if result["verdict"] == "TRUE" and top_w >= 0.9:
-            score = min(100, int(score * 1.1))
-        elif result["verdict"] == "FALSE" and top_w < 0.7:
-            score = max(0, int(score * 0.9))
-        result["credibility_score"] = score
+
+        # Step 4 — Groq with tool calling
+        # (Groq decides whether to search web based on evidence quality)
+        try:
+            result = await self._call_groq_with_tools(claim, retrieved)
+        except Exception as e:
+            logger.error(f"Groq call failed: {e}")
+            return self._error_result(claim, claim_type, str(e))
+
+        # Step 5 — trust weight adjustment
+        all_docs = retrieved + ([] if not result.get("web_searched") else [])
+        if all_docs:
+            top_w = max(
+                (d.get("final_weight", d.get("weight", 0.6))
+                 for d in all_docs[:3]),
+                default=0.6
+            )
+            score = result["credibility_score"]
+            if result["verdict"] == "TRUE" and top_w >= 0.9:
+                score = min(100, int(score * 1.1))
+            elif result["verdict"] == "FALSE" and top_w < 0.7:
+                score = max(0, int(score * 0.9))
+            result["credibility_score"] = score
 
         final = {
             **result,
@@ -382,73 +609,24 @@ class VerifyAgent:
         logger.info(
             f"Verdict: {final['verdict']} | "
             f"Score: {final['credibility_score']} | "
-            f"{claim[:50]}..."
+            f"Web searched: {result.get('web_searched', False)}"
         )
         return final
 
-    async def _check_template_cache(self, claim: str) -> Optional[dict]:
-        try:
-            from backend.db.mongodb import get_db
-            db  = get_db()
-            emb = self._embedder.encode([claim])[0].tolist()
+    # ── Helpers ───────────────────────────────────────────────
 
-            templates = await db.templates.find(
-                {}, {"template_text": 1, "verdict": 1,
-                     "credibility_score": 1, "explanation": 1,
-                     "source": 1, "embedding": 1}
-            ).to_list(length=200)
-
-            for t in templates:
-                if not t.get("embedding"):
-                    continue
-                a = np.array(emb)
-                b = np.array(t["embedding"])
-                sim = float(
-                    np.dot(a, b) /
-                    (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10)
-                )
-                if sim > 0.85:
-                    # Update occurrence count
-                    await db.templates.update_one(
-                        {"_id": t["_id"]},
-                        {"$inc": {"occurrence_count": 1},
-                         "$set": {"last_seen": datetime.utcnow()}}
-                    )
-                    return {
-                        "verdict":           t["verdict"],
-                        "credibility_score": t["credibility_score"],
-                        "reasoning":         t.get("explanation", ""),
-                        "sources":           [t.get("source", "")],
-                        "claim":             claim,
-                    }
-        except Exception as e:
-            logger.warning(f"Template cache check failed: {e}")
-        return None
-
-    def _no_sources_result(self, claim: str, claim_type: str) -> dict:
-        return {
-            "claim":             claim,
-            "verdict":           "UNVERIFIABLE",
-            "credibility_score": 40,
-            "reasoning":         "No relevant trusted sources found. "
-                                 "Check ndma.gov.in or mausam.imd.gov.in "
-                                 "for official updates.",
-            "sources":           [],
-            "claim_type":        claim_type,
-            "retrieved_docs":    [],
-            "from_cache":        False,
-            "verified_at":       datetime.utcnow().isoformat(),
-        }
-
-    def _error_result(self, claim: str, error: str) -> dict:
+    def _error_result(
+        self, claim: str, claim_type: str, error: str
+    ) -> dict:
         return {
             "claim":             claim,
             "verdict":           "UNVERIFIABLE",
             "credibility_score": 0,
             "reasoning":         f"Verification error: {error}",
             "sources":           [],
-            "claim_type":        "EPHEMERAL",
+            "claim_type":        claim_type,
             "retrieved_docs":    [],
+            "web_searched":      False,
             "from_cache":        False,
             "verified_at":       datetime.utcnow().isoformat(),
         }

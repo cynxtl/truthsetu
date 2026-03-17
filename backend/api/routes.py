@@ -1,11 +1,15 @@
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from backend.agents.verify_agent import get_verify_agent, VerifyAgent
+from backend.agents.scout_agent import get_scout_agent, ScoutAgent
 from backend.db.mongodb import get_db
+from backend.core.pipeline import get_pipeline, TruthSetuPipeline
 
 router = APIRouter()
 
 
+# ── Request schemas ───────────────────────────────────────────
 class ClaimRequest(BaseModel):
     claim: str
     platform: str = "manual"
@@ -18,6 +22,14 @@ class OverrideRequest(BaseModel):
     admin_id: str
 
 
+class SubmitRequest(BaseModel):
+    text: str
+    platform: str = "manual"
+    sender_number: Optional[str] = None
+    source_url: Optional[str] = None
+
+
+# ── VERIFY ────────────────────────────────────────────────────
 @router.post("/verify", tags=["VERIFY"])
 async def verify_claim(
     payload: ClaimRequest,
@@ -42,6 +54,27 @@ async def rebuild_index(agent: VerifyAgent = Depends(get_verify_agent)):
     return {"status": "Index rebuilt successfully"}
 
 
+# ── SCOUT ─────────────────────────────────────────────────────
+@router.post("/scout/submit", tags=["SCOUT"])
+async def submit_claim(
+    payload: SubmitRequest,
+    scout: ScoutAgent = Depends(get_scout_agent)
+):
+    result = await scout.process(
+        text=payload.text,
+        platform=payload.platform,
+        sender_number=payload.sender_number,
+        source_url=payload.source_url,
+    )
+    return result
+
+
+@router.get("/scout/status", tags=["SCOUT"])
+async def scout_status(scout: ScoutAgent = Depends(get_scout_agent)):
+    return await scout.get_status()
+
+
+# ── DASHBOARD ─────────────────────────────────────────────────
 @router.get("/claims", tags=["Dashboard"])
 async def get_claims(limit: int = 20, skip: int = 0):
     try:
@@ -95,3 +128,27 @@ async def get_stats():
             "corrections_deployed": 0, "languages_active": 0,
             "avg_response_minutes": 0,
         }
+
+# ── PIPELINE ──────────────────────────────────────────────────
+class PipelineRequest(BaseModel):
+    text: str
+    platform: str = "manual"
+    sender_number: Optional[str] = None
+    language: str = "en"
+    metrics: Optional[dict] = None
+
+
+@router.post("/pipeline/run", tags=["Pipeline"])
+async def run_pipeline(
+    payload: PipelineRequest,
+    pipeline: TruthSetuPipeline = Depends(get_pipeline)
+):
+    """Run the full pipeline: SCOUT → VERIFY → TRANSLATE → DEPLOY → LEARN"""
+    result = await pipeline.run(
+        text=payload.text,
+        platform=payload.platform,
+        sender_number=payload.sender_number,
+        language=payload.language,
+        metrics=payload.metrics or {},
+    )
+    return result
