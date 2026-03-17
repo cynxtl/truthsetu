@@ -1,0 +1,23 @@
+# Environment variables — NEVER commit these
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+*.egg-info/
+
+# Data — too large for git
+data/faiss_index/index.faiss
+data/faiss_index/documents.json
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
