@@ -49,7 +49,7 @@ CRISIS_KEYWORDS = [
 VIRALITY_THRESHOLDS = {
     "twitter":  {"retweets": 50,  "replies": 20,  "likes": 200},
     "telegram": {"forwards": 30},
-    "whatsapp": {"reports": 3},   # 3 different users report same claim
+    "whatsapp": {"reports": 1},   # 3 different users report same claim
     "manual":   {"reports": 1},   # manual submissions always pass
 }
 

@@ -28,9 +28,10 @@ class Settings(BaseSettings):
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     faiss_index_path: str = "./data/faiss_index"
 
-    # WhatsApp
-    green_api_instance_id: str = ""
-    green_api_token: str = ""
+    # Twilio
+    twilio_account_sid:   str = ""
+    twilio_auth_token:    str = ""
+    twilio_whatsapp_from: str = "whatsapp:+14155238886"
 
     # Telegram
     telegram_bot_token: str = ""

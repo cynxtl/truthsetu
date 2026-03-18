@@ -28,7 +28,6 @@ class TruthSetuPipeline:
         self._learn     = None
 
     async def _get_agents(self):
-        """Lazy load agents."""
         if not self._scout:
             from backend.agents.scout_agent import get_scout_agent
             self._scout = await get_scout_agent()
@@ -40,6 +39,10 @@ class TruthSetuPipeline:
         if not self._translate:
             from backend.agents.translate_agent import get_translate_agent
             self._translate = await get_translate_agent()
+
+        if not self._deploy:
+            from backend.agents.deploy_agent import get_deploy_agent
+            self._deploy = await get_deploy_agent()
 
 
     async def run(
@@ -190,11 +193,17 @@ class TruthSetuPipeline:
         # ── Step 4: DEPLOY ────────────────────────────────────
         logger.info("Step 4: DEPLOY")
         try:
-            deploy_result = await self._deploy_stub(
-                sender_number=sender_number,
+            translations  = result["steps"]["translate"].get("translations", {})
+            deploy_result = await self._deploy.deploy(
+                sender_number=sender_number or "",
+                claim=claim,
+                verdict=verify_result["verdict"],
+                score=verify_result["credibility_score"],
+                reasoning=verify_result["reasoning"],
+                sources=verify_result["sources"],
+                translations=translations,
+                citizen_language=language,
                 platform=platform,
-                message=result["steps"]["translate"]["correction_en"],
-                language=language,
             )
             result["steps"]["deploy"] = deploy_result
 
