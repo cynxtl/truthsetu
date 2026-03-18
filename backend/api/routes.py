@@ -5,6 +5,7 @@ from backend.agents.verify_agent import get_verify_agent, VerifyAgent
 from backend.agents.scout_agent import get_scout_agent, ScoutAgent
 from backend.db.mongodb import get_db
 from backend.core.pipeline import get_pipeline, TruthSetuPipeline
+from backend.agents.translate_agent import get_translate_agent, TranslateAgent
 
 router = APIRouter()
 
@@ -152,3 +153,43 @@ async def run_pipeline(
         metrics=payload.metrics or {},
     )
     return result
+
+# ── TRANSLATE ─────────────────────────────────────────────────
+class TranslateRequest(BaseModel):
+    message: str
+    target_languages: Optional[list[str]] = None
+    citizen_language: Optional[str] = None
+
+
+@router.post("/translate", tags=["TRANSLATE"])
+async def translate_message(
+    payload: TranslateRequest,
+    agent: TranslateAgent = Depends(get_translate_agent)
+):
+    """Translate a verified correction into Indian languages."""
+    if not payload.message.strip():
+        raise HTTPException(
+            status_code=422, detail="Message cannot be empty."
+        )
+    result = await agent.translate(
+        message=payload.message,
+        target_languages=payload.target_languages,
+        citizen_language=payload.citizen_language,
+    )
+    return result
+
+
+@router.post("/translate/detect-language", tags=["TRANSLATE"])
+async def detect_language(
+    payload: dict,
+    agent: TranslateAgent = Depends(get_translate_agent)
+):
+    """Detect the language of incoming text."""
+    text = payload.get("text", "")
+    if not text:
+        raise HTTPException(status_code=422, detail="Text required.")
+    lang = await agent.detect_language(text)
+    return {
+        "language": lang,
+        "text":     text[:50],
+    }

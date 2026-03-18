@@ -28,7 +28,7 @@ class TruthSetuPipeline:
         self._learn     = None
 
     async def _get_agents(self):
-        """Lazy load agents — only initialise when first needed."""
+        """Lazy load agents."""
         if not self._scout:
             from backend.agents.scout_agent import get_scout_agent
             self._scout = await get_scout_agent()
@@ -37,8 +37,10 @@ class TruthSetuPipeline:
             from backend.agents.verify_agent import get_verify_agent
             self._verify = await get_verify_agent()
 
-        # TRANSLATE, DEPLOY, LEARN loaded after they're built
-        # For now these are placeholders
+        if not self._translate:
+            from backend.agents.translate_agent import get_translate_agent
+            self._translate = await get_translate_agent()
+
 
     async def run(
         self,
@@ -148,12 +150,27 @@ class TruthSetuPipeline:
 
             # TRANSLATE agent not built yet — use English for now
             # Will be replaced when translate_agent.py is built
-            translated = await self._translate_stub(
-                correction_en, language
+            # Detect citizen language if not provided
+            if language == "en":
+                language = await self._translate.detect_language(text)
+                logger.info(f"Detected citizen language: {language}")
+
+            # Translate to Hindi + Marathi always
+            # Plus citizen's language if different
+            target_langs = ["hi", "mr"]
+            if language not in target_langs and language != "en":
+                target_langs.append(language)
+
+            translated = await self._translate.translate(
+                message=correction_en,
+                target_languages=target_langs,
+                citizen_language=language,
             )
             result["steps"]["translate"] = {
-                "correction_en": correction_en,
-                "translations":  translated,
+                "correction_en":     correction_en,
+                "translations":      translated["translations"],
+                "priority_language": translated["priority_language"],
+                "citizen_language":  language,
             }
 
         except Exception as e:

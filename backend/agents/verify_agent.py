@@ -467,8 +467,28 @@ class VerifyAgent:
                     args  = json.loads(tool_call.function.arguments)
                     query = args.get("query", claim)
 
-                    # Actually search the web
-                    results     = await self._web_search(query)
+                    # Fast path: check recent RSS first
+                    rss_results = []
+                    try:
+                        from backend.core.rss_monitor import get_rss_monitor
+                        monitor     = await get_rss_monitor()
+                        rss_results = await monitor.search_recent_rss(query)
+                        if rss_results:
+                            logger.info(
+                                f"RSS fast-path: {len(rss_results)} "
+                                f"recent entries found"
+                            )
+                    except Exception:
+                        pass
+
+                    # If RSS has good results use them, otherwise web search
+                    if rss_results and rss_results[0]["similarity"] > 0.5:
+                        results = rss_results
+                        logger.info("Using RSS results (skipping web search)")
+                    else:
+                        results = await self._web_search(query)
+                        logger.info("Using web search results")
+
                     search_results.extend(results)
                     web_searched = True
 

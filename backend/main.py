@@ -1,3 +1,6 @@
+"""
+TruthSetu — FastAPI Application
+"""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -12,16 +15,38 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Startup ───────────────────────────────────────────────
     logger.info("TruthSetu starting up...")
     await connect_db()
+
+    # Start background scheduler
+    from backend.core.scheduler import start_scheduler
+    await start_scheduler()
+
+    # Run initial RSS fetch on startup
+    try:
+        from backend.core.rss_monitor import get_rss_monitor
+        monitor = await get_rss_monitor()
+        logger.info("Running initial RSS fetch...")
+        await monitor.refresh_faiss_index()
+        await monitor.monitor_fact_checkers()
+        logger.success("Initial RSS fetch complete ✓")
+    except Exception as e:
+        logger.warning(f"Initial RSS fetch failed (non-fatal): {e}")
+
     yield
-    logger.info("TruthSetu shutting down...")
+
+    # ── Shutdown ──────────────────────────────────────────────
+    from backend.core.scheduler import stop_scheduler
+    await stop_scheduler()
     await close_db()
+    logger.info("TruthSetu shutdown complete.")
 
 
 app = FastAPI(
     title="TruthSetu API",
-    description="AI-Based Multi-Agent System to Detect, Verify and Counter Crisis Misinformation",
+    description="AI-Based Multi-Agent System to Detect, Verify "
+                "and Counter Crisis Misinformation in Real Time",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -45,3 +70,20 @@ async def health_check():
         "env":    settings.app_env,
         "llm":    settings.llm_provider,
     }
+
+
+@app.get("/scheduler/status")
+async def scheduler_status():
+    """Check what scheduled jobs are running."""
+    from backend.core.scheduler import _scheduler
+    if not _scheduler:
+        return {"status": "not running"}
+    jobs = [
+        {
+            "id":       job.id,
+            "name":     job.name,
+            "next_run": str(job.next_run_time),
+        }
+        for job in _scheduler.get_jobs()
+    ]
+    return {"status": "running", "jobs": jobs}
