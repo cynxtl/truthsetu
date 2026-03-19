@@ -12,39 +12,6 @@ from backend.db.mongodb import get_db
 
 settings = get_settings()
 
-# ── Crisis keywords ───────────────────────────────────────────
-CRISIS_KEYWORDS = [
-    # English — weather & disaster
-    "cyclone", "flood", "earthquake", "tsunami", "disaster",
-    "evacuation", "emergency", "alert", "warning", "rescue",
-    "trapped", "missing", "casualties", "death toll", "blast",
-    "explosion", "fire", "attack", "riot", "violence",
-    # English — health
-    "pandemic", "virus", "outbreak", "epidemic", "covid",
-    "corona", "vaccine", "vaccination", "injection", "dose",
-    "booster", "lockdown", "quarantine", "hospital", "medicine",
-    "drug", "cure", "treatment", "health emergency", "disease",
-    # English — political/social
-    "election fraud", "evm hacked", "fake news", "misinformation",
-    "free distribution", "government scheme", "aadhaar", "ban",
-    "demonetization", "currency", "arrest", "curfew",
-    # English — infrastructure
-    "dam broke", "dam burst", "radiation leak", "gas leak",
-    "power cut", "water supply", "contaminated",
-    # Hindi
-    "बाढ़", "चक्रवात", "भूकंप", "महामारी", "वायरस",
-    "अफवाह", "निकासी", "चुनाव", "बांध टूटा", "टीका",
-    "लॉकडाउन", "अस्पताल", "दवा", "मौत", "हमला",
-    # Tamil
-    "வெள்ளம்", "புயல்", "நிலநடுக்கம்", "தொற்று", "தடுப்பூசி",
-    # Telugu
-    "వరద", "తుఫాను", "భూకంపం", "వైరస్", "వ్యాక్సిన్",
-    # Marathi
-    "पूर", "चक्रीवादळ", "भूकंप", "साथीचा रोग", "लस",
-    # Bengali
-    "বন্যা", "ঘূর্ণিঝড়", "ভূমিকম্প", "ভাইরাস", "ভ্যাকসিন",
-]
-
 # ── Virality thresholds ───────────────────────────────────────
 VIRALITY_THRESHOLDS = {
     "twitter":  {"retweets": 50,  "replies": 20,  "likes": 200},
@@ -65,11 +32,6 @@ class ScoutAgent:
         self._embedder = SentenceTransformer(settings.embedding_model)
         self._ready = True
         logger.success("SCOUT agent ready ✓")
-
-    # ── Layer 1: Keyword filter ───────────────────────────────
-    def _passes_keyword_filter(self, text: str) -> bool:
-        text_lower = text.lower()
-        return any(kw.lower() in text_lower for kw in CRISIS_KEYWORDS)
 
     # ── Layer 2: Virality gate ────────────────────────────────
     def _passes_virality_gate(
@@ -133,21 +95,33 @@ class ScoutAgent:
 
             prompt = PromptTemplate(
                 input_variables=["text"],
-                template="""Does this post contain a specific factual claim 
-about a crisis, disaster, health emergency, or election?
+                template="""A citizen sent this message to a fact-checking service.
+                Extract the core factual claim they want verified.
 
-If YES: Extract the single core factual claim in one clear sentence.
-If NO:  Respond with exactly: NO_CLAIM
+                Rules:
+                - If it's a question like "is X true?" → extract "X is true" as the claim
+                - If it's a statement like "X happened" → extract it directly
+                - If it's a forward like "Breaking: X" → extract the core claim
+                - If it's just a greeting or completely unrelated → respond: NO_CLAIM
 
-Post: "{text}"
+                Examples:
+                "is modi dead?" → "Modi has died"
+                "Is it true cyclone is hitting Chennai?" → "A cyclone is hitting Chennai"
+                "Mullaperiyar dam has broken!!" → "The Mullaperiyar dam has broken"
+                "COVID vaccine contains microchips" → "COVID vaccine contains microchips"
+                "hello" → NO_CLAIM
+                "what's the weather today" → NO_CLAIM
+                "thanks" → NO_CLAIM
 
-Respond with either the claim sentence or NO_CLAIM only:"""
+                Message: "{text}"
+
+                Respond with the claim in one sentence or NO_CLAIM only:"""
             )
             chain  = prompt | get_llm() | StrOutputParser()
             result = await chain.ainvoke({"text": text[:500]})
             result = result.strip()
 
-            if result == "NO_CLAIM" or len(result) < 10:
+            if result == "NO_CLAIM" or len(result) < 5:
                 return None
             return result
 
@@ -169,11 +143,6 @@ Respond with either the claim sentence or NO_CLAIM only:"""
 
         metrics = metrics or {}
         logger.info(f"SCOUT processing [{platform}]: {text[:60]}...")
-
-        # Layer 1 — keyword filter
-        if not self._passes_keyword_filter(text):
-            logger.debug("Dropped: no crisis keywords")
-            return {"status": "dropped", "reason": "no_crisis_keywords"}
 
         # Layer 2 — virality gate (manual submissions always pass)
         if not self._passes_virality_gate(platform, metrics):
