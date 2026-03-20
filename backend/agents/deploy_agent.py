@@ -58,9 +58,6 @@ def format_whatsapp_message(
             f"🟡 *FACT CHECK — UNVERIFIABLE*\n\n"
             f"⚠️ We could not confirm or deny:\n\"{claim}\"\n\n"
             f"No official sources have addressed this yet.\n"
-            f"Please check:\n"
-            f"• ndma.gov.in\n"
-            f"• mausam.imd.gov.in\n\n"
             f"⏱ Checked: {timestamp}\n\n"
             f"— TruthSetu | Verified Information"
         )
@@ -158,21 +155,25 @@ class DeployAgent:
             if citizen_language in translations:
                 t = translations[citizen_language]
                 if t.get("success") and t.get("text"):
-                    logger.info(
-                        f"Sending in citizen language: "
-                        f"{citizen_language}"
-                    )
+                    logger.info(f"Sending in citizen language: {citizen_language}")
                     return t["text"]
 
-            # Try Hindi as widely understood fallback
+            # Try English next
+            if "en" in translations:
+                t = translations["en"]
+                if t.get("success") and t.get("text"):
+                    logger.info("Sending in English")
+                    return t["text"]
+
+            # Try Hindi as last resort
             if "hi" in translations:
                 t = translations["hi"]
                 if t.get("success") and t.get("text"):
                     logger.info("Sending in Hindi")
                     return t["text"]
 
-        # English fallback
-        logger.info("Sending in English")
+        # Final fallback
+        logger.info("Composing English fallback")
         return format_whatsapp_message(
             claim=claim,
             verdict=verdict,

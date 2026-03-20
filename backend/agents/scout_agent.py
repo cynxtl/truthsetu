@@ -1,23 +1,20 @@
-import asyncio
-import hashlib
+"""
+TruthSetu — SCOUT Agent
+"""
 from datetime import datetime, timedelta
 from typing import Optional
-import feedparser
 import numpy as np
 from loguru import logger
-from sentence_transformers import SentenceTransformer
-
 from backend.core.config import get_settings
 from backend.db.mongodb import get_db
 
 settings = get_settings()
 
-# ── Virality thresholds ───────────────────────────────────────
 VIRALITY_THRESHOLDS = {
-    "twitter":  {"retweets": 50,  "replies": 20,  "likes": 200},
+    "twitter":  {"retweets": 50, "replies": 20, "likes": 200},
     "telegram": {"forwards": 30},
-    "whatsapp": {"reports": 1},   # 3 different users report same claim
-    "manual":   {"reports": 1},   # manual submissions always pass
+    "whatsapp": {"reports": 1},
+    "manual":   {"reports": 1},
 }
 
 
@@ -29,19 +26,14 @@ class ScoutAgent:
 
     async def initialize(self):
         logger.info("Initialising SCOUT agent...")
+        from sentence_transformers import SentenceTransformer
         self._embedder = SentenceTransformer(settings.embedding_model)
         self._ready = True
         logger.success("SCOUT agent ready ✓")
 
-    # ── Layer 2: Virality gate ────────────────────────────────
-    def _passes_virality_gate(
-        self, platform: str, metrics: dict
-    ) -> bool:
-        if platform == "manual":
+    def _passes_virality_gate(self, platform: str, metrics: dict) -> bool:
+        if platform in ["manual", "whatsapp"]:
             return True
-        if platform == "whatsapp":
-            return metrics.get("reports", 1) >= \
-                   VIRALITY_THRESHOLDS["whatsapp"]["reports"]
         if platform == "twitter":
             t = VIRALITY_THRESHOLDS["twitter"]
             return (
@@ -54,13 +46,10 @@ class ScoutAgent:
                    VIRALITY_THRESHOLDS["telegram"]["forwards"]
         return True
 
-    # ── Layer 3: Semantic deduplication ──────────────────────
     async def _is_duplicate(self, claim: str) -> Optional[dict]:
         try:
             db  = get_db()
             emb = self._embedder.encode([claim])[0].tolist()
-
-            # Check claims from last 24 hours
             cutoff = datetime.utcnow() - timedelta(hours=24)
             recent = await db.claims.find(
                 {"detected_at": {"$gte": cutoff}},
@@ -78,7 +67,7 @@ class ScoutAgent:
                 )
                 if sim > 0.85:
                     return {
-                        "original_id":   str(doc["_id"]),
+                        "original_id":    str(doc["_id"]),
                         "original_claim": doc["claim_text"],
                         "similarity":     sim,
                     }
@@ -86,7 +75,6 @@ class ScoutAgent:
             logger.warning(f"Dedup check failed: {e}")
         return None
 
-    # ── Layer 4: Claim extraction via Groq ───────────────────
     async def _extract_claim(self, text: str) -> Optional[str]:
         try:
             from backend.core.llm import get_llm
@@ -96,26 +84,26 @@ class ScoutAgent:
             prompt = PromptTemplate(
                 input_variables=["text"],
                 template="""A citizen sent this message to a fact-checking service.
-                Extract the core factual claim they want verified.
+Extract the core factual claim they want verified.
 
-                Rules:
-                - If it's a question like "is X true?" → extract "X is true" as the claim
-                - If it's a statement like "X happened" → extract it directly
-                - If it's a forward like "Breaking: X" → extract the core claim
-                - If it's just a greeting or completely unrelated → respond: NO_CLAIM
+Rules:
+- If it's a question like "is X true?" → extract "X is true" as the claim
+- If it's a statement like "X happened" → extract it directly
+- If it's a forward like "Breaking: X" → extract the core claim
+- If it's just a greeting or completely unrelated → respond: NO_CLAIM
 
-                Examples:
-                "is modi dead?" → "Modi has died"
-                "Is it true cyclone is hitting Chennai?" → "A cyclone is hitting Chennai"
-                "Mullaperiyar dam has broken!!" → "The Mullaperiyar dam has broken"
-                "COVID vaccine contains microchips" → "COVID vaccine contains microchips"
-                "hello" → NO_CLAIM
-                "what's the weather today" → NO_CLAIM
-                "thanks" → NO_CLAIM
+Examples:
+  "is modi dead?" → "Modi has died"
+  "Is it true cyclone is hitting Chennai?" → "A cyclone is hitting Chennai"
+  "Mullaperiyar dam has broken!!" → "The Mullaperiyar dam has broken"
+  "COVID vaccine contains microchips" → "COVID vaccine contains microchips"
+  "hello" → NO_CLAIM
+  "what's the weather today" → NO_CLAIM
+  "thanks" → NO_CLAIM
 
-                Message: "{text}"
+Message: "{text}"
 
-                Respond with the claim in one sentence or NO_CLAIM only:"""
+Respond with the claim in one sentence or NO_CLAIM only:"""
             )
             chain  = prompt | get_llm() | StrOutputParser()
             result = await chain.ainvoke({"text": text[:500]})
@@ -129,7 +117,6 @@ class ScoutAgent:
             logger.warning(f"Claim extraction failed: {e}")
             return None
 
-    # ── Main entry point ─────────────────────────────────────
     async def process(
         self,
         text: str,
@@ -144,18 +131,15 @@ class ScoutAgent:
         metrics = metrics or {}
         logger.info(f"SCOUT processing [{platform}]: {text[:60]}...")
 
-        # Layer 2 — virality gate (manual submissions always pass)
         if not self._passes_virality_gate(platform, metrics):
             logger.debug("Dropped: below virality threshold")
             return {"status": "dropped", "reason": "below_virality_threshold"}
 
-        # Layer 3 — extract claim via LLM
         claim = await self._extract_claim(text)
         if not claim:
             logger.debug("Dropped: no factual claim found")
             return {"status": "dropped", "reason": "no_claim_found"}
 
-        # Layer 4 — semantic deduplication
         duplicate = await self._is_duplicate(claim)
         if duplicate:
             logger.info(f"Duplicate detected (sim={duplicate['similarity']:.2f})")
@@ -165,7 +149,6 @@ class ScoutAgent:
                 "duplicate": duplicate,
             }
 
-        # Save to MongoDB
         emb = self._embedder.encode([claim])[0].tolist()
         db  = get_db()
         doc = {
@@ -189,10 +172,7 @@ class ScoutAgent:
             "platform": platform,
         }
 
-    # ── WhatsApp incoming handler ─────────────────────────────
-    async def handle_whatsapp(
-        self, message: str, sender_number: str
-    ) -> dict:
+    async def handle_whatsapp(self, message: str, sender_number: str) -> dict:
         return await self.process(
             text=message,
             platform="whatsapp",
@@ -200,7 +180,6 @@ class ScoutAgent:
             metrics={"reports": 1},
         )
 
-    # ── Status ────────────────────────────────────────────────
     async def get_status(self) -> dict:
         try:
             db    = get_db()
@@ -220,7 +199,6 @@ class ScoutAgent:
             return {"ready": self._ready, "monitoring": False}
 
 
-# ── Singleton ─────────────────────────────────────────────────
 _scout: Optional[ScoutAgent] = None
 
 

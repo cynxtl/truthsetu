@@ -1,17 +1,9 @@
 """
 TruthSetu — Pipeline Orchestrator
-Connects all 5 agents end to end using simple async chain.
-
-Flow:
-  SCOUT → VERIFY → TRANSLATE → DEPLOY → LEARN
-
-Called from:
-  - WhatsApp webhook (citizen forwards message)
-  - Manual submission via /scout/submit
-  - Admin dashboard
+SCOUT → VERIFY → TRANSLATE → DEPLOY → LEARN
 """
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from loguru import logger
 
@@ -44,7 +36,6 @@ class TruthSetuPipeline:
             from backend.agents.deploy_agent import get_deploy_agent
             self._deploy = await get_deploy_agent()
 
-
     async def run(
         self,
         text: str,
@@ -54,13 +45,9 @@ class TruthSetuPipeline:
         metrics: Optional[dict] = None,
         language: str = "en",
     ) -> dict:
-        """
-        Main entry point. Run full pipeline for a single message.
-        Returns final result dict.
-        """
         await self._get_agents()
 
-        pipeline_start = datetime.utcnow()
+        pipeline_start = datetime.now(timezone.utc)
         logger.info(f"Pipeline started [{platform}]: {text[:60]}...")
 
         result = {
@@ -86,20 +73,17 @@ class TruthSetuPipeline:
 
             if scout_result["status"] == "dropped":
                 logger.info(f"Pipeline stopped at SCOUT: {scout_result['reason']}")
-                result["status"]  = "dropped"
-                result["reason"]  = scout_result["reason"]
+                result["status"]     = "dropped"
+                result["reason"]     = scout_result["reason"]
                 result["stopped_at"] = "scout"
                 return result
 
+            claim = scout_result["duplicate"]["original_claim"] \
+                if scout_result["status"] == "duplicate" \
+                else scout_result["claim"]
+
             if scout_result["status"] == "duplicate":
-                # Duplicate — still send cached verdict to citizen
-                logger.info("Duplicate claim — fetching cached verdict")
-                claim = scout_result["duplicate"]["original_claim"]
                 result["steps"]["scout"]["extracted_claim"] = claim
-                # Skip to VERIFY with the original claim
-                # (will hit template cache instantly)
-            else:
-                claim = scout_result["claim"]
 
         except Exception as e:
             logger.error(f"SCOUT failed: {e}")
@@ -114,14 +98,13 @@ class TruthSetuPipeline:
             verify_result = await self._verify.verify(claim, platform)
             result["steps"]["verify"] = {
                 "verdict":           verify_result["verdict"],
-                "credibility_score": verify_result["credibility_score"],
+                "credibility_score": verify_result.get("credibility_score", 0),
                 "reasoning":         verify_result["reasoning"],
                 "sources":           verify_result["sources"],
                 "from_cache":        verify_result.get("from_cache", False),
                 "claim_type":        verify_result.get("claim_type", "EPHEMERAL"),
             }
 
-            # Save verdict to MongoDB
             try:
                 db = get_db()
                 await db.verdicts.insert_one({
@@ -146,49 +129,52 @@ class TruthSetuPipeline:
             correction_en = self._compose_correction(
                 claim=claim,
                 verdict=verify_result["verdict"],
-                score=verify_result["credibility_score"],
                 reasoning=verify_result["reasoning"],
                 sources=verify_result["sources"],
             )
 
-            # TRANSLATE agent not built yet — use English for now
-            # Will be replaced when translate_agent.py is built
-            # Detect citizen language if not provided
-            if language == "en":
-                language = await self._translate.detect_language(text)
-                logger.info(f"Detected citizen language: {language}")
+            # Detect citizen's language from original message
+            detected_lang = await self._translate.detect_language(text)
+            logger.info(f"Detected citizen language: {detected_lang}")
 
-            # Translate to Hindi + Marathi always
-            # Plus citizen's language if different
-            target_langs = ["hi", "mr"]
-            if language not in target_langs and language != "en":
-                target_langs.append(language)
+            # Translate only if non-English
+            if detected_lang in ["hi", "mr"]:
+                translated = await self._translate.translate(
+                    message=correction_en,
+                    target_languages=[detected_lang],
+                    citizen_language=detected_lang,
+                )
+            else:
+                # English or unknown → reply in English
+                translated = {
+                    "translations":      {"en": {"text": correction_en, "success": True}},
+                    "priority_language": "en",
+                }
+                detected_lang = "en"
 
-            translated = await self._translate.translate(
-                message=correction_en,
-                target_languages=target_langs,
-                citizen_language=language,
-            )
             result["steps"]["translate"] = {
                 "correction_en":     correction_en,
                 "translations":      translated["translations"],
                 "priority_language": translated["priority_language"],
-                "citizen_language":  language,
+                "citizen_language":  detected_lang,
             }
+            language = detected_lang
 
         except Exception as e:
             logger.warning(f"TRANSLATE failed (non-fatal): {e}")
             correction_en = self._compose_correction(
                 claim=claim,
                 verdict=verify_result["verdict"],
-                score=verify_result["credibility_score"],
                 reasoning=verify_result["reasoning"],
                 sources=verify_result["sources"],
             )
             result["steps"]["translate"] = {
-                "correction_en": correction_en,
-                "translations":  {"en": correction_en},
+                "correction_en":     correction_en,
+                "translations":      {"en": {"text": correction_en, "success": True}},
+                "priority_language": "en",
+                "citizen_language":  "en",
             }
+            language = "en"
 
         # ── Step 4: DEPLOY ────────────────────────────────────
         logger.info("Step 4: DEPLOY")
@@ -198,7 +184,7 @@ class TruthSetuPipeline:
                 sender_number=sender_number or "",
                 claim=claim,
                 verdict=verify_result["verdict"],
-                score=verify_result["credibility_score"],
+                score=verify_result.get("credibility_score", 0),
                 reasoning=verify_result["reasoning"],
                 sources=verify_result["sources"],
                 translations=translations,
@@ -219,123 +205,73 @@ class TruthSetuPipeline:
                 result["steps"]["learn"] = {"status": "template_stored"}
             else:
                 result["steps"]["learn"] = {"status": "skipped"}
-
         except Exception as e:
             logger.warning(f"LEARN failed (non-fatal): {e}")
             result["steps"]["learn"] = {"status": "failed", "error": str(e)}
 
-        # ── Final result ──────────────────────────────────────
-        pipeline_end = datetime.utcnow()
+        # ── Final ─────────────────────────────────────────────
+        pipeline_end = datetime.now(timezone.utc)
         duration     = (pipeline_end - pipeline_start).total_seconds()
 
-        result["status"]      = "completed"
-        result["verdict"]     = verify_result["verdict"]
-        result["score"]       = verify_result["credibility_score"]
-        result["completed_at"] = pipeline_end.isoformat()
+        result["status"]           = "completed"
+        result["verdict"]          = verify_result["verdict"]
+        result["completed_at"]     = pipeline_end.isoformat()
         result["duration_seconds"] = round(duration, 2)
 
         logger.success(
             f"Pipeline completed in {duration:.1f}s | "
-            f"Verdict: {verify_result['verdict']} | "
-            f"Score: {verify_result['credibility_score']}"
+            f"Verdict: {verify_result['verdict']}"
         )
         return result
 
-    # ── Message composer ──────────────────────────────────────
     def _compose_correction(
         self,
-        claim: str,
-        verdict: str,
-        score: int,
+        claim:     str,
+        verdict:   str,
         reasoning: str,
-        sources: list,
+        sources:   list,
     ) -> str:
-        """Compose the WhatsApp reply message."""
-
-        source_line = ""
-        if sources:
-            source_line = f"\n📎 Source: {sources[0]}"
+        """Compose the WhatsApp reply — no score, just summary."""
+        source_line = f"\n📎 Source: {sources[0]}" if sources else ""
+        timestamp   = datetime.now(timezone.utc).strftime(
+            "%d %b %Y, %I:%M %p"
+        ) + " IST"
 
         if verdict == "FALSE":
             return (
                 f"🔴 *FACT CHECK — FALSE*\n\n"
-                f"❌ Claim being shared:\n\"{claim}\"\n\n"
-                f"✅ What is actually true:\n{reasoning}"
+                f"❌ Claim: \"{claim}\"\n\n"
+                f"✅ What sources say:\n{reasoning}"
                 f"{source_line}\n\n"
-                f"📊 Credibility: {score}/100\n"
-                f"⏱ Checked: {datetime.utcnow().strftime('%d %b %Y, %I:%M %p')} IST\n\n"
-                f"— TruthSetu | Verified Information"
+                f"⏱ Checked: {timestamp}\n"
+                f"— TruthSetu"
             )
-
-        elif verdict == "TRUE":
+        elif verdict in ["TRUE", "CONFIRMED"]:
             return (
                 f"🟢 *FACT CHECK — CONFIRMED*\n\n"
-                f"✅ This claim is confirmed:\n\"{claim}\"\n\n"
-                f"{reasoning}"
+                f"✅ Claim: \"{claim}\"\n\n"
+                f"📋 What sources say:\n{reasoning}"
                 f"{source_line}\n\n"
-                f"📊 Credibility: {score}/100\n"
-                f"⏱ Checked: {datetime.utcnow().strftime('%d %b %Y, %I:%M %p')} IST\n\n"
-                f"— TruthSetu | Verified Information"
+                f"⏱ Checked: {timestamp}\n"
+                f"— TruthSetu"
             )
-
-        else:  # UNVERIFIABLE
+        else:
             return (
-                f"🟡 *FACT CHECK — UNVERIFIABLE*\n\n"
-                f"⚠️ We could not confirm or deny:\n\"{claim}\"\n\n"
-                f"No official sources have addressed this yet.\n"
-                f"Please check:\n"
+                f"🟡 *FACT CHECK — UNVERIFIED*\n\n"
+                f"⚠️ Claim: \"{claim}\"\n\n"
+                f"📋 What sources say:\n{reasoning}"
+                f"{source_line}\n\n"
+                f"For official information:\n"
                 f"• ndma.gov.in\n"
-                f"• mausam.imd.gov.in\n"
-                f"• mohfw.gov.in\n\n"
-                f"⏱ Checked: {datetime.utcnow().strftime('%d %b %Y, %I:%M %p')} IST\n\n"
-                f"— TruthSetu | Verified Information"
+                f"• mausam.imd.gov.in\n\n"
+                f"⏱ Checked: {timestamp}\n"
+                f"— TruthSetu"
             )
-
-    # ── Stubs (replaced when agents are built) ────────────────
-    async def _translate_stub(
-        self, text: str, language: str
-    ) -> dict:
-        """
-        Placeholder until translate_agent.py is built.
-        Returns English only for now.
-        """
-        return {"en": text}
-
-    async def _deploy_stub(
-        self,
-        sender_number: Optional[str],
-        platform: str,
-        message: str,
-        language: str,
-    ) -> dict:
-        """
-        Placeholder until deploy_agent.py is built.
-        Logs the message that would be sent.
-        """
-        if sender_number:
-            logger.info(
-                f"[DEPLOY STUB] Would send to {sender_number} "
-                f"via {platform}:\n{message[:100]}..."
-            )
-            return {
-                "status":   "stub",
-                "would_send_to": sender_number,
-                "platform": platform,
-                "message_preview": message[:100],
-            }
-        return {"status": "no_recipient"}
 
     async def _learn_stub(self, claim: str, verdict: dict) -> None:
-        """
-        Placeholder until learn_agent.py is built.
-        Just logs for now.
-        """
-        logger.info(
-            f"[LEARN STUB] Would store template for: {claim[:60]}"
-        )
+        logger.info(f"[LEARN STUB] Would store template for: {claim[:60]}")
 
 
-# ── Singleton ─────────────────────────────────────────────────
 _pipeline: Optional[TruthSetuPipeline] = None
 
 

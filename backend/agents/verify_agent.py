@@ -8,18 +8,21 @@ Pipeline:
   4. Groq reasons over FAISS + web results
   5. Return structured verdict
 """
+from __future__ import annotations
 
 import json
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 import faiss
 import numpy as np
 from groq import Groq
 from loguru import logger
-from sentence_transformers import SentenceTransformer
 import feedparser
 from bs4 import BeautifulSoup
 
@@ -87,49 +90,66 @@ WEB_SEARCH_TOOL = {
 }
 
 # ── System prompt ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are TruthSetu, India's crisis fact-checking AI.
-Your job is to verify claims during emergencies — cyclones, floods, 
-pandemics, elections, and communal events.
+SYSTEM_PROMPT = """You are TruthSetu, India's crisis fact-checking AI assistant.
 
-VERIFICATION RULES:
-1. Base your verdict ONLY on provided documents and web search results
-2. Do NOT use your training data knowledge — always verify with sources
-3. Government sources (GOV) take highest priority
-4. Fact-check sources (FC) are strong evidence
-5. If documents are insufficient, USE the search_web tool
-6. Search specifically for Indian government sources when relevant
+Your job is to help citizens understand what is actually known about a claim
+based on current news and official sources.
+
+CRITICAL RULES:
+1. NEVER say an event is happening unless official sources explicitly confirm it NOW
+2. "Tensions", "possibility", "risk", "fear of" — these do NOT mean the event is happening
+3. Summarise what sources actually say — do not interpret beyond what is written
+4. Be honest about uncertainty
+5. Keep summary to 2-3 sentences maximum
 
 VERDICT CRITERIA:
-- FALSE        (score 0-34):  Contradicts trusted sources
-- UNVERIFIABLE (score 35-69): Insufficient evidence found
-- TRUE         (score 70-100): Supported by trusted sources
+- FALSE:       Sources directly and clearly contradict the claim
+- CONFIRMED:   Official sources explicitly confirm the event is happening RIGHT NOW
+- UNVERIFIED:  Sources are related but do not directly confirm or deny the claim
+- NO_INFO:     No relevant sources found at all
 
-IMPORTANT: You MUST use search_web if:
-- No documents are relevant to the claim
-- Documents are older than 24 hours for time-sensitive claims
-- The claim mentions a specific recent event you need to verify"""
+EXAMPLES OF CORRECT BEHAVIOUR:
+  Claim: "War starting today in India"
+  Sources: Articles about India-Pakistan tensions, border incidents
+  WRONG verdict: CONFIRMED — war is starting
+  RIGHT verdict: UNVERIFIED
+  RIGHT summary: "Sources report heightened India-Pakistan border tensions and
+                  military activity, but no official war declaration has been
+                  made by either government."
+
+  Claim: "Cyclone hitting Chennai in 2 hours"
+  Sources: IMD bulletin saying cyclone is 500km away
+  RIGHT verdict: FALSE
+  RIGHT summary: "IMD confirms the cyclone is currently 500km from Chennai
+                  coast with no immediate threat to the city."
+
+  Claim: "Government announced free vaccine distribution"
+  Sources: PIB press release confirming vaccine drive
+  RIGHT verdict: CONFIRMED
+  RIGHT summary: "PIB confirms the government has announced a free vaccination
+                  drive starting Monday across all districts." """
+
 
 # ── User prompt template ──────────────────────────────────────
 def build_user_prompt(claim: str, docs_context: str) -> str:
     return f"""Verify this claim: "{claim}"
 
-DOCUMENTS FROM KNOWLEDGE BASE:
-{docs_context if docs_context else "No relevant documents found in knowledge base."}
+SOURCES:
+{docs_context if docs_context else "No relevant documents found."}
 
-INSTRUCTIONS:
-- Review the documents above
-- If they are sufficient to verify the claim, return your verdict
-- If they are insufficient or outdated, use search_web to find current information
-- After searching, combine all evidence and return your verdict
-
-Return your final verdict as JSON:
+Analyse the sources carefully. Return ONLY this JSON:
 {{
-  "verdict": "TRUE" or "FALSE" or "UNVERIFIABLE",
+  "verdict": "FALSE" or "CONFIRMED" or "UNVERIFIED" or "NO_INFO",
   "credibility_score": <integer 0-100>,
-  "reasoning": "<2-3 sentences citing your sources>",
+  "reasoning": "<2-3 sentence summary of what sources actually say — not what you think, what sources say>",
   "sources_used": ["<source names>"],
   "web_searched": true or false
-}}"""
+}}
+
+Remember:
+- Only say CONFIRMED if a source explicitly states the event is happening NOW
+- If sources show tensions/risks/possibilities → use UNVERIFIED
+- If sources directly contradict the claim → use FALSE"""
 
 
 def freshness_weight(date_str: str, claim_type: str) -> float:
@@ -166,14 +186,9 @@ class VerifyAgent:
 
     async def initialize(self):
         logger.info("Initialising VERIFY agent...")
-
-        # Sentence transformer for embeddings
+        from sentence_transformers import SentenceTransformer
         self._embedder = SentenceTransformer(settings.embedding_model)
-
-        # Direct Groq client for tool calling
-        # (LangChain doesn't support tool calling + streaming well)
         self._groq = Groq(api_key=settings.groq_api_key)
-
         await self._load_or_build_index()
         self._ready = True
         logger.success("VERIFY agent ready ✓")
@@ -350,7 +365,7 @@ class VerifyAgent:
             results.append(doc)
 
         results.sort(key=lambda x: x["final_weight"], reverse=True)
-        return results
+        return results if results else []
 
     def _format_docs(self, docs: list) -> str:
         if not docs:
@@ -421,7 +436,8 @@ class VerifyAgent:
         """
         docs_context  = self._format_docs(faiss_docs)
         user_message  = build_user_prompt(claim, docs_context)
-        messages      = [
+        from typing import Any
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_message},
         ]
