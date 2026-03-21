@@ -76,6 +76,23 @@ class TruthSetuPipeline:
                 result["status"]     = "dropped"
                 result["reason"]     = scout_result["reason"]
                 result["stopped_at"] = "scout"
+
+                # Send helpful reply to citizen
+                if sender_number and scout_result["reason"] == "no_claim_found":
+                    try:
+                        deploy = await self._deploy._send_whatsapp(
+                            sender_number,
+                            "🤔 *We couldn't find a verifiable claim in your message.*\n\n"
+                            "Please try sending:\n"
+                            "• A specific claim to check\n"
+                            "• A question about news or events\n"
+                            "• A WhatsApp forward you want verified\n\n"
+                            "Example: _\"Is it true that cyclone is hitting Chennai?\"_\n\n"
+                            "— TruthSetu"
+                        )
+                    except Exception:
+                        pass
+
                 return result
 
             claim = scout_result["duplicate"]["original_claim"] \
@@ -261,9 +278,6 @@ class TruthSetuPipeline:
                 f"⚠️ Claim: \"{claim}\"\n\n"
                 f"📋 What sources say:\n{reasoning}"
                 f"{source_line}\n\n"
-                f"For official information:\n"
-                f"• ndma.gov.in\n"
-                f"• mausam.imd.gov.in\n\n"
                 f"⏱ Checked: {timestamp}\n"
                 f"— TruthSetu"
             )

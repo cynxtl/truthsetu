@@ -478,7 +478,7 @@ class VerifyAgent:
             })
 
             # Execute each tool call
-            for tool_call in msg.tool_calls:
+            for tool_call in msg.tool_calls[:3]:
                 if tool_call.function.name == "search_web":
                     args  = json.loads(tool_call.function.arguments)
                     query = args.get("query", claim)
@@ -571,7 +571,7 @@ class VerifyAgent:
             "verdict":           verdict,
             "credibility_score": score,
             "reasoning":         raw[:300],
-            "sources":           [d["url"] for d in docs[:2]],
+            "sources":           [d["url"] for d in docs[:2]] if docs else [],
         }
 
     # ── Main entry point ──────────────────────────────────────
