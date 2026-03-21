@@ -8,6 +8,7 @@ from backend.agents.scout_agent import get_scout_agent, ScoutAgent
 from backend.agents.translate_agent import get_translate_agent, TranslateAgent
 from backend.db.mongodb import get_db
 from backend.core.pipeline import get_pipeline, TruthSetuPipeline
+from backend.agents.learn_agent import get_learn_agent, LearnAgent
 
 router = APIRouter()
 
@@ -251,3 +252,7 @@ async def get_stats():
             "corrections_deployed": 0, "languages_active": 0,
             "avg_response_minutes": 0,
         }
+# ── LEARN ─────────────────────────────────────────────────────
+@router.get("/learn/stats", tags=["LEARN"])
+async def learn_stats(agent: LearnAgent = Depends(get_learn_agent)):
+    return await agent.get_stats()

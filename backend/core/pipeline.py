@@ -36,6 +36,10 @@ class TruthSetuPipeline:
             from backend.agents.deploy_agent import get_deploy_agent
             self._deploy = await get_deploy_agent()
 
+        if not self._learn:
+            from backend.agents.learn_agent import get_learn_agent
+            self._learn = await get_learn_agent()
+
     async def run(
         self,
         text: str,
@@ -214,14 +218,18 @@ class TruthSetuPipeline:
             logger.warning(f"DEPLOY failed (non-fatal): {e}")
             result["steps"]["deploy"] = {"status": "failed", "error": str(e)}
 
-        # ── Step 5: LEARN ─────────────────────────────────────
+        # ── Step 5: LEARN ─────────────────────────────────────────
         logger.info("Step 5: LEARN")
         try:
-            if verify_result["verdict"] == "FALSE":
-                await self._learn_stub(claim, verify_result)
-                result["steps"]["learn"] = {"status": "template_stored"}
-            else:
-                result["steps"]["learn"] = {"status": "skipped"}
+            learn_result = await self._learn.learn(
+                claim=claim,
+                verdict=verify_result["verdict"],
+                reasoning=verify_result["reasoning"],
+                sources=verify_result["sources"],
+                platform=platform,
+                claim_type=verify_result.get("claim_type", "EPHEMERAL"),
+            )
+            result["steps"]["learn"] = learn_result
         except Exception as e:
             logger.warning(f"LEARN failed (non-fatal): {e}")
             result["steps"]["learn"] = {"status": "failed", "error": str(e)}
