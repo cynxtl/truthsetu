@@ -3,7 +3,7 @@ TruthSetu — Pipeline Orchestrator
 SCOUT → VERIFY → TRANSLATE → DEPLOY → LEARN
 """
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from loguru import logger
 
@@ -258,7 +258,8 @@ class TruthSetuPipeline:
     ) -> str:
         """Compose the WhatsApp reply — no score, just summary."""
         source_line = f"\n📎 Source: {sources[0]}" if sources else ""
-        timestamp   = datetime.now(timezone.utc).strftime(
+        ist_tz      = timezone(timedelta(hours=5, minutes=30))
+        timestamp   = datetime.now(ist_tz).strftime(
             "%d %b %Y, %I:%M %p"
         ) + " IST"
 

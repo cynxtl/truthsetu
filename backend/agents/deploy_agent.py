@@ -11,7 +11,7 @@ Future:
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from loguru import logger
 
@@ -29,7 +29,8 @@ def format_whatsapp_message(
 ) -> str:
     """Compose English WhatsApp message."""
     source_line = f"\n📎 Source: {sources[0]}" if sources else ""
-    timestamp   = datetime.now(timezone.utc).strftime(
+    ist_tz      = timezone(timedelta(hours=5, minutes=30))
+    timestamp   = datetime.now(ist_tz).strftime(
         "%d %b %Y, %I:%M %p"
     ) + " IST"
 
