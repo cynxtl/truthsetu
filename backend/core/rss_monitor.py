@@ -477,9 +477,7 @@ class RSSMonitor:
         """
         try:
             from backend.db.mongodb import get_db
-            from backend.core.llm import get_llm
-            from langchain_core.prompts import PromptTemplate
-            from langchain_core.output_parsers import StrOutputParser
+            from groq import AsyncGroq
 
             db = get_db()
 
@@ -492,9 +490,7 @@ class RSSMonitor:
             content = doc["text"][:500]
 
             # Extract the false claim being debunked
-            prompt = PromptTemplate(
-                input_variables=["content", "source"],
-                template="""This is from {source}, an Indian fact-checking website.
+            prompt = f"""This is from {source}, an Indian fact-checking website.
 Extract the FALSE claim being debunked.
 
 Article content:
@@ -506,14 +502,15 @@ Rules:
 - If no clear false claim found, respond: NO_CLAIM
 
 Respond with the false claim only or NO_CLAIM:"""
-            )
 
-            chain  = prompt | get_llm() | StrOutputParser()
-            result = await chain.ainvoke({
-                "content": content,
-                "source":  source,
-            })
-            result = result.strip()
+            client = AsyncGroq(api_key=settings.groq_api_key)
+            response = await client.chat.completions.create(
+                model=settings.groq_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=200,
+            )
+            result = response.choices[0].message.content.strip()
 
             if result == "NO_CLAIM" or len(result) < 10:
                 return
