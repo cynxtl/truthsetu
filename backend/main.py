@@ -72,18 +72,4 @@ async def health_check():
     }
 
 
-@app.get("/scheduler/status")
-async def scheduler_status():
-    """Check what scheduled jobs are running."""
-    from backend.core.scheduler import _scheduler
-    if not _scheduler:
-        return {"status": "not running"}
-    jobs = [
-        {
-            "id":       job.id,
-            "name":     job.name,
-            "next_run": str(job.next_run_time),
-        }
-        for job in _scheduler.get_jobs()
-    ]
-    return {"status": "running", "jobs": jobs}
+# scheduler_status moved to routes.py

@@ -420,25 +420,8 @@ class RSSMonitor:
             # Add to index
             index.add(emb)
 
-            # Merge and prune old entries
-            now     = datetime.now(timezone.utc)
-            cutoff  = now - timedelta(days=7)
+            # Merge old entries
             all_docs = existing + truly_new
-            all_docs = [
-                d for d in all_docs
-                if (
-                    # Keep government docs for 30 days
-                    d.get("tier") == "government" and
-                    self._parse_date(d.get("date","")) > now - timedelta(days=30)
-                ) or (
-                    # Keep other docs for 7 days
-                    d.get("tier") != "government" and
-                    self._parse_date(d.get("date","")) > cutoff
-                ) or (
-                    # Always keep static facts
-                    d.get("source") == "truthsetu.static"
-                )
-            ]
 
             # Save
             faiss.write_index(index, str(index_file))

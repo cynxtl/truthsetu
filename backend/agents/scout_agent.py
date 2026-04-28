@@ -77,13 +77,12 @@ class ScoutAgent:
 
     async def _extract_claim(self, text: str) -> Optional[str]:
         try:
-            from backend.core.llm import get_llm
-            from langchain_core.prompts import PromptTemplate
-            from langchain_core.output_parsers import StrOutputParser
+            from groq import Groq
+            from backend.core.config import get_settings
+            settings = get_settings()
+            client = Groq(api_key=settings.groq_api_key)
 
-            prompt = PromptTemplate(
-                input_variables=["text"],
-                template="""A citizen sent this message to a fact-checking service.
+            prompt = f"""A citizen sent this message to a fact-checking service.
 Extract the core factual claim they want verified.
 
 Rules:
@@ -95,19 +94,19 @@ Rules:
 Examples:
   "is modi dead?" → "Modi has died"
   "Is it true cyclone is hitting Chennai?" → "A cyclone is hitting Chennai"
-  "Mullaperiyar dam has broken!!" → "The Mullaperiyar dam has broken"
-  "COVID vaccine contains microchips" → "COVID vaccine contains microchips"
   "hello" → NO_CLAIM
-  "what's the weather today" → NO_CLAIM
-  "thanks" → NO_CLAIM
 
-Message: "{text}"
+Message: "{text[:500]}"
 
 Respond with the claim in one sentence or NO_CLAIM only:"""
+
+            response = client.chat.completions.create(
+                model=settings.groq_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=100,
             )
-            chain  = prompt | get_llm() | StrOutputParser()
-            result = await chain.ainvoke({"text": text[:500]})
-            result = result.strip()
+            result = response.choices[0].message.content.strip()
 
             if result == "NO_CLAIM" or len(result) < 5:
                 return None

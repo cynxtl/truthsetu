@@ -252,6 +252,22 @@ async def get_stats():
             "corrections_deployed": 0, "languages_active": 0,
             "avg_response_minutes": 0,
         }
+@router.get("/scheduler/status", tags=["Dashboard"])
+async def scheduler_status():
+    from backend.core.scheduler import _scheduler
+    if not _scheduler:
+        return {"status": "not running"}
+    jobs = [
+        {
+            "id":       job.id,
+            "name":     job.name,
+            "next_run": str(job.next_run_time),
+        }
+        for job in _scheduler.get_jobs()
+    ]
+    return {"status": "running", "jobs": jobs}
+
+
 # ── LEARN ─────────────────────────────────────────────────────
 @router.get("/learn/stats", tags=["LEARN"])
 async def learn_stats(agent: LearnAgent = Depends(get_learn_agent)):
